@@ -1,0 +1,34 @@
+services:
+  opencode:
+    image: ghcr.io/anomalyco/opencode:${OPENCODE_VERSION:?Set OPENCODE_VERSION in .env}@${OPENCODE_IMAGE_DIGEST:?Set OPENCODE_IMAGE_DIGEST in .env}
+    command: ["serve", "--hostname", "0.0.0.0", "--port", "4096"]
+    working_dir: /workspace
+    environment:
+      OPENCODE_CONFIG_DIR: /root/.config/opencode
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?Set OPENCODE_SERVER_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:4096:4096"
+    volumes:
+      - type: bind
+        source: ./opencode
+        target: /root/.config/opencode
+        read_only: true
+      - type: bind
+        source: ${WORKSPACE_DIR:?Set WORKSPACE_DIR in .env}
+        target: /workspace
+      - type: volume
+        source: opencode-data
+        target: /root/.local
+    healthcheck:
+      test: ["CMD-SHELL", "auth=$$(printf 'opencode:%s' \"$${OPENCODE_SERVER_PASSWORD}\" | base64 | tr -d '\\n'); wget -q -O /dev/null --header=\"Authorization: Basic $$auth\" http://127.0.0.1:4096/global/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  opencode-data:
