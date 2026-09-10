@@ -9,11 +9,14 @@ workspace path; the repositories themselves remain outside this repository.
 - The server is published only as `127.0.0.1:4096` on the host.
 - HTTP Basic authentication is enabled by `OPENCODE_SERVER_PASSWORD`; the
   default username is `opencode`.
-- `./opencode` is mounted read-only at `/root/.config/opencode`, which is also
+- `./opencode` is mounted read-only at `/home/opencode/.config/opencode`, which is also
   selected through `OPENCODE_CONFIG_DIR`.
 - The external workspace is the only read/write host bind mount.
 - Database, provider credentials, and session state persist in the
-  Compose-managed `opencode-data` volume at `/root/.local`.
+  Compose-managed `opencode-data` volume at `/home/opencode/.local`.
+- OpenCode runs as the invoking host user's numeric `HOST_UID:HOST_GID`.
+- `/home/opencode` is a user-owned tmpfs home. Cache and other non-persistent
+  home files are ephemeral; the data volume and read-only config mount overlay it.
 - Playwright MCP runs in its official container and is reachable only on the
   internal Compose network.
 - Exa, Context7, GitHub, and Postman use their official hosted HTTPS MCP
@@ -21,9 +24,10 @@ workspace path; the repositories themselves remain outside this repository.
 - The stack has no Docker socket mount, privileged mode, host networking, or
   Tailscale container.
 
-OpenCode's official image currently runs as root. Files it creates in the
-workspace can therefore be root-owned on the host. Correct ownership with
-`sudo chown` if needed, or create files in the repository on the host first.
+The official image is used directly. Its `/root` is mode `0700`, and a numeric
+user without `HOME` resolves its default data path to `/.local`. An explicit,
+writable home avoids both failures without a root startup wrapper or a custom
+image. Files created in the workspace use the configured host UID/GID.
 
 ## Install
 
@@ -46,10 +50,21 @@ When `.env` already exists, rerun `sudo ./scripts/setup.sh` without a workspace
 argument to add or rotate MCP keys while preserving existing values when a
 prompt is left blank.
 
+Setup derives `HOST_UID` and `HOST_GID` using `id` for the invoking user, or
+`SUDO_USER` when run through sudo. It also leaves `.env` owned by that user and
+their primary group. No `1000:1000` default is assumed. Direct root invocation
+without a non-root `SUDO_USER` is rejected. Normal invocation requires access to
+Docker and write access to this repository.
+
+For a new installation, setup initializes ownership of an **empty** data
+volume using a one-shot root helper. It never recursively changes an existing
+volume. Existing root-owned installations must complete the migration below;
+setup reports an error if the configured user cannot write existing data.
+
 The workspace is mounted at the same absolute path inside the container. Setup
 also installs `~/.local/bin/opencode` and mode-`0600` client credential files
 under `~/.config/opencode-stack`. This lets the local TUI attach to the server
-without exposing the root-owned stack `.env`.
+using its dedicated client credential file.
 
 The host client requires `mise` with OpenCode installed. For Bash login users,
 setup adds an `opencode` function to `~/.bashrc` that invokes the wrapper by
@@ -220,23 +235,109 @@ database snapshot, then stream the volume into a restricted backup file:
 umask 077
 mkdir -p backups
 docker compose run --rm --no-deps -T --entrypoint tar opencode \
-  -C /root/.local -czf - . > backups/opencode-$(date +%Y%m%d).backup.tar.gz
+  -C /home/opencode/.local -czf - . > backups/opencode-$(date +%Y%m%d).backup.tar.gz
 ```
 
 The `backups/` directory and `*.backup.tar.gz` are ignored by Git. Move backups
 to encrypted storage; a local ignored file is not sufficient protection.
 
+## Migrate an existing root-owned data volume
+
+Use this procedure before starting the updated service. It retains the same
+named volume and the same internal `share/` and `state/` tree. Only ownership
+and the container mount destination change. Do not run `down --volumes`, remove
+the volume, or recursively change ownership of the host workspace.
+
+1. Set `HOST_UID` and `HOST_GID` in `.env` to `id -u USER` and `id -g USER` for
+   the intended normal host user. Running setup through sudo does this too;
+   its existing-data check may stop with the migration message. Keep `.env`
+   mode `0600` and owned by that user and primary group.
+2. Stop **only OpenCode**. Discover and inspect the actual project volume and
+   pinned image from its existing container. These commands also work with the
+   old `/root/.local` mount. Run them from this repository in a shell with Docker
+   access; substitute the intended account for `YOUR_NORMAL_USER`:
+
+   ```sh
+   host_user=YOUR_NORMAL_USER
+   uid=$(id -u "$host_user")
+   gid=$(id -g "$host_user")
+   test "$uid" -ne 0 && test "$gid" -ne 0
+   docker compose stop opencode
+   container=$(docker compose ps -aq opencode)
+   volume=$(docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}' "$container")
+   image=$(docker inspect --format '{{.Image}}' "$container")
+   project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$container")
+   docker volume inspect "$volume"
+   test "$(docker volume inspect --format '{{index .Labels "com.docker.compose.project"}}' "$volume")" = "$project"
+   test "$(docker volume inspect --format '{{index .Labels "com.docker.compose.volume"}}' "$volume")" = opencode-data
+   ```
+
+3. Back up while stopped. The helper has **only this volume** mounted,
+   read-only, and no network. The second complete read must have the same hash
+   as the stored archive; do not continue on any error or mismatch. The tar
+   archive preserves original numeric ownership and permissions for recovery.
+
+   ```sh
+   umask 077
+   mkdir -p backups
+   backup="backups/opencode-$(date +%Y%m%dT%H%M%S).backup.tar"
+   docker run --rm --network none --security-opt no-new-privileges:true \
+     --label "com.docker.compose.project=$project" --user 0:0 \
+     --mount "type=volume,src=$volume,dst=/data,readonly" \
+     --entrypoint tar "$image" -C /data -cf - . > "$backup"
+   sha256sum "$backup"
+   docker run --rm --network none --security-opt no-new-privileges:true \
+     --label "com.docker.compose.project=$project" --user 0:0 \
+     --mount "type=volume,src=$volume,dst=/data,readonly" \
+     --entrypoint tar "$image" -C /data -cf - . | sha256sum
+   ```
+
+4. After verifying the backup, change ownership **only inside this volume**.
+   `find -xdev` does not cross filesystems; `chown -h` does not follow symlinks.
+   No file contents or permission modes are changed:
+
+   ```sh
+   docker run --rm --network none --security-opt no-new-privileges:true \
+     --label "com.docker.compose.project=$project" --user 0:0 \
+     --mount "type=volume,src=$volume,dst=/data" \
+     --entrypoint sh "$image" -eu -c \
+     'find /data -xdev -exec chown -h "$1:$2" {} +' sh "$uid" "$gid"
+   docker compose up --detach --no-deps --wait opencode
+   ./scripts/doctor.sh
+   docker compose exec -T opencode opencode auth list
+   docker compose exec -T opencode opencode db 'PRAGMA integrity_check'
+   docker compose exec -T opencode opencode db 'SELECT count(*) AS sessions FROM session'
+   ```
+
+   Compare session IDs/counts and provider listings before and after migration.
+   `auth list` confirms credential discovery; a successful provider request is
+   needed to verify live authentication. Keep the backup until satisfied.
+
+Run doctor as the intended user, or through sudo so `SUDO_USER` identifies them.
+It checks configured and actual process IDs, `.env` ownership, mount properties,
+data writability, a temporary container-created workspace file and its cleanup,
+authenticated health, Playwright health, and IPv4-loopback-only publication.
+The ownership probe removes its temporary file on failure or interruption too.
+
+The host workspace must already allow this user to write. Previously root-owned
+workspace files are not repaired automatically; review individual affected
+files separately. This configuration assumes ordinary Linux Docker UID mapping;
+rootless Docker or user-namespace remapping may need additional mapping work,
+and doctor will expose a mismatch.
+
 ## Recovery
 
-Recovery replaces the current contents of the persistent volume. Keep the
-server stopped, verify the backup path, then run:
+Recovery replaces persistent contents and requires a deliberate decision and a
+verified backup. Keep the server stopped. The example below is for routine gzip
+backups; a migration `.backup.tar` is uncompressed (use `tar -xf`, not `-xzf`).
+For a pre-migration archive, restore as root to preserve its metadata, then
+repeat the verified ownership migration before starting the non-root service:
 
 ```sh
 ./scripts/stop.sh
-docker compose run --rm --no-deps -T --entrypoint sh opencode -c \
-  'rm -rf /root/.local/* /root/.local/.[!.]* /root/.local/..?*; tar -C /root/.local -xzf -' \
-  < backups/opencode-YYYYMMDD.backup.tar.gz
-./scripts/start.sh
+docker compose run --rm --no-deps -T --user 0:0 --entrypoint sh opencode -eu -c \
+  'rm -rf /home/opencode/.local/* /home/opencode/.local/.[!.]* /home/opencode/.local/..?*; tar -C /home/opencode/.local -xzf -' \
+   < backups/opencode-YYYYMMDD.backup.tar.gz
 ```
 
 Removing the stack with `docker compose down` preserves the volume. Running
@@ -254,6 +355,16 @@ This stack follows the current official OpenCode documentation and source:
 
 OpenCode documents `GET /global/health` as the health endpoint. Its Linux data
 paths are `~/.local/share/opencode` for the database/auth data and
-`~/.local/state/opencode` for session state; mounting `/root/.local` preserves
-both.
+`~/.local/state/opencode` for state. With `HOME=/home/opencode`, the layout is:
 
+| Purpose | Container path | Lifetime |
+| --- | --- | --- |
+| Database, sessions, logs, provider `auth.json` | `/home/opencode/.local/share/opencode` | Existing named volume |
+| State and locks | `/home/opencode/.local/state/opencode` | Existing named volume |
+| Cache and downloaded tools | `/home/opencode/.cache/opencode` | Ephemeral home tmpfs |
+| Config | `/home/opencode/.config/opencode` | Read-only `./opencode` bind |
+
+These paths were verified with `opencode debug paths` in the pinned official
+image and its [global path implementation](https://github.com/anomalyco/opencode/blob/v1.18.29/packages/core/src/global.ts).
+No XDG overrides or passwd entry are required. Cache is regenerated after
+container recreation; database/session data and provider logins persist.

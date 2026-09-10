@@ -2,9 +2,11 @@ services:
   opencode:
     image: ghcr.io/anomalyco/opencode:${OPENCODE_VERSION:?Set OPENCODE_VERSION in .env}@${OPENCODE_IMAGE_DIGEST:?Set OPENCODE_IMAGE_DIGEST in .env}
     command: ["serve", "--hostname", "0.0.0.0", "--port", "4096"]
+    user: "${HOST_UID:?Run setup.sh to set HOST_UID}:${HOST_GID:?Run setup.sh to set HOST_GID}"
     working_dir: ${WORKSPACE_DIR:?Set WORKSPACE_DIR in .env}
     environment:
-      OPENCODE_CONFIG_DIR: /root/.config/opencode
+      HOME: /home/opencode
+      OPENCODE_CONFIG_DIR: /home/opencode/.config/opencode
       OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?Set OPENCODE_SERVER_PASSWORD in .env}
       EXA_API_KEY: ${EXA_API_KEY:-}
       CONTEXT7_API_KEY: ${CONTEXT7_API_KEY:-}
@@ -15,14 +17,18 @@ services:
     volumes:
       - type: bind
         source: ./opencode
-        target: /root/.config/opencode
+        target: /home/opencode/.config/opencode
         read_only: true
       - type: bind
         source: ${WORKSPACE_DIR:?Set WORKSPACE_DIR in .env}
         target: ${WORKSPACE_DIR:?Set WORKSPACE_DIR in .env}
       - type: volume
         source: opencode-data
-        target: /root/.local
+        target: /home/opencode/.local
+    # The official image's /root is 0700. Give the numeric user a writable,
+    # ephemeral home; data/state remain on the existing named volume.
+    tmpfs:
+      - /home/opencode:uid=${HOST_UID},gid=${HOST_GID},mode=0700
     healthcheck:
       test: ["CMD-SHELL", "auth=$$(printf 'opencode:%s' \"$${OPENCODE_SERVER_PASSWORD}\" | base64 | tr -d '\\n'); wget -q -O /dev/null --header=\"Authorization: Basic $$auth\" http://127.0.0.1:4096/global/health"]
       interval: 10s

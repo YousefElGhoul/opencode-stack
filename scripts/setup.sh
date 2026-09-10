@@ -4,6 +4,9 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
+. "$root/scripts/host-user.sh"
+resolve_host_user
+
 if [ "$#" -gt 1 ]; then
   printf 'Usage: %s [absolute/path/to/workspace]\n' "$0" >&2
   exit 2
@@ -25,6 +28,9 @@ set_env() {
   awk -v key="$key" 'index($0, key "=") != 1' .env >"$tmp"
   printf '%s=%s\n' "$key" "$value" >>"$tmp"
   chmod 600 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then
+    chown "$host_uid:$host_gid" "$tmp"
+  fi
   mv "$tmp" .env
 }
 
@@ -71,11 +77,10 @@ prompt_secret() {
 }
 
 install_client() {
-  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
-    client_user=$SUDO_USER
+  client_user=$host_user
+  if [ "$(id -u)" -eq 0 ]; then
     client_home=$(getent passwd "$client_user" | cut -d: -f6)
   else
-    client_user=$(id -un)
     client_home=$HOME
   fi
   client_group=$(id -gn "$client_user")
@@ -158,6 +163,8 @@ else
   set_env OPENCODE_SERVER_PASSWORD "$password"
 fi
 
+set_env HOST_UID "$host_uid"
+set_env HOST_GID "$host_gid"
 ensure_env OPENCODE_VERSION 1.18.29
 ensure_env OPENCODE_IMAGE_DIGEST sha256:ecc3bf96ee55dad226d9cde50d79aaa8a1215c47860c0fcdc71570461bf438b8
 ensure_env PLAYWRIGHT_MCP_VERSION v0.0.80
@@ -172,6 +179,26 @@ install_client
 
 docker compose config --quiet
 docker compose pull
+# Only initialize an empty volume. Existing state requires the explicit,
+# backed-up migration in README.md; setup never recursively changes ownership.
+docker compose run --rm --no-deps -T --user 0:0 --entrypoint sh opencode -eu -c '
+  data=/home/opencode/.local
+  if [ -z "$(ls -A "$data")" ]; then
+    chown "$1:$2" "$data"
+  fi
+' sh "$host_uid" "$host_gid"
+if ! docker compose run --rm --no-deps -T --entrypoint sh opencode -eu -c '
+  test -w /home/opencode/.local
+  for path in /home/opencode/.local/share/opencode /home/opencode/.local/state/opencode; do
+    if [ -e "$path" ]; then test -w "$path"; fi
+  done
+  for path in /home/opencode/.local/share/opencode/opencode.db /home/opencode/.local/share/opencode/auth.json; do
+    if [ -e "$path" ]; then test -r "$path" && test -w "$path"; fi
+  done
+'; then
+  printf 'Persistent data needs an ownership migration. Follow README.md before starting OpenCode.\n' >&2
+  exit 1
+fi
 image=$(docker compose config --images | grep '^ghcr.io/anomalyco/opencode:')
 version=${image%%@*}
 version=${version##*:}
