@@ -1,7 +1,7 @@
 services:
   opencode:
     image: ghcr.io/anomalyco/opencode:${OPENCODE_VERSION:?Set OPENCODE_VERSION in .env}@${OPENCODE_IMAGE_DIGEST:?Set OPENCODE_IMAGE_DIGEST in .env}
-    command: ["web", "--hostname", "0.0.0.0", "--port", "4096"]
+    command: ["serve", "--hostname", "0.0.0.0", "--port", "4096"]
     working_dir: ${WORKSPACE_DIR:?Set WORKSPACE_DIR in .env}
     environment:
       OPENCODE_CONFIG_DIR: /root/.config/opencode
