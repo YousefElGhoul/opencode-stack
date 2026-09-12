@@ -1,3 +1,32 @@
+<!--
+---
+portfolio:
+  title: "OpenCode Stack"
+  subtitle: "Containerized Remote AI Development Environment"
+  type: 
+    - Infrastructure
+    - DevOps
+  status: "Maintained"
+  time: "2026"
+
+  description: "A reproducible Docker Compose environment for running an authenticated OpenCode headless development server with persistent state, isolated tooling, MCP integrations, secure remote access through Tailscale, and documented backup and recovery procedures."
+
+  skills:
+    - Docker
+    - Docker Compose
+    - Linux
+    - OpenCode
+    - Tailscale
+    - Shell Scripting
+    - MCP
+    - Infrastructure
+    - Security
+
+  live: null
+  slug: "opencode-stack"
+---
+-->
+
 # OpenCode Headless Server
 
 A minimal Docker Compose environment for one authenticated OpenCode headless
