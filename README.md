@@ -27,42 +27,70 @@ portfolio:
 ---
 -->
 
-# OpenCode Headless Server
+# OpenCode Remote Development Workstation
 
-A minimal Docker Compose environment for one authenticated OpenCode headless
-server. OpenCode can read and modify repositories under the configured absolute
-workspace path; the repositories themselves remain outside this repository.
+A Docker Compose development workstation with an authenticated OpenCode server,
+a Debian/glibc toolchain, persistent non-root home, and a Chromium MCP sidecar.
+Repositories stay bind-mounted at their original absolute paths. JavaScript
+dependencies are isolated from the host in per-package Docker volumes.
 
 ## Security model
 
 - The server is published only as `127.0.0.1:4096` on the host.
 - HTTP Basic authentication is enabled by `OPENCODE_SERVER_PASSWORD`; the
   default username is `opencode`.
-- `./opencode` is mounted read-only at `/home/opencode/.config/opencode`, which is also
-  selected through `OPENCODE_CONFIG_DIR`.
+- `./opencode` is mounted read-only at `/etc/opencode-stack`. Its
+  `opencode.json` is selected through `OPENCODE_CONFIG`; skills are loaded from
+  `/etc/opencode-stack/skills`. Applications can write their own `~/.config`.
 - The external workspace is the only read/write host bind mount.
 - Database, provider credentials, and session state persist in the
   Compose-managed `opencode-data` volume at `/home/opencode/.local`.
 - OpenCode runs as the invoking host user's numeric `HOST_UID:HOST_GID`.
-- `/home/opencode` is a user-owned tmpfs home. Cache and other non-persistent
-  home files are ephemeral; the data volume and read-only config mount overlay it.
-- Playwright MCP runs in its official container and is reachable only on the
-  internal Compose network.
+- `/home/opencode` is a user-owned `opencode-home` volume for application config,
+  caches, package-manager stores, and other home files. The existing data volume
+  is mounted inside it at `.local` and retains its original contents.
+- `/tmp/opencode` is private user-owned tmpfs, recreated on each start.
+- Playwright MCP and Chromium run in the official sidecar, sharing **OpenCode's
+  container network namespace**. The MCP endpoint binds only to shared loopback
+  at `127.0.0.1:8931`; it is not published on the host.
 - Exa, Context7, GitHub, and Postman use their official hosted HTTPS MCP
   endpoints; no redundant local proxies are created.
 - The stack has no Docker socket mount, privileged mode, host networking, or
   Tailscale container.
 
-The official image is used directly. Its `/root` is mode `0700`, and a numeric
-user without `HOME` resolves its default data path to `/.local`. An explicit,
-writable home avoids both failures without a root startup wrapper or a custom
-image. Files created in the workspace use the configured host UID/GID.
+The official OpenCode runtime image is Alpine/musl and lacks a development
+toolchain. `Dockerfile` instead uses a digest-pinned official Node 22 image on
+Debian Trixie and installs the same pinned official `opencode-ai` npm release.
+The image has a real passwd entry matching `HOST_UID:HOST_GID`. Startup runs
+without root and only verifies writable directories; it never installs tools
+or recursively changes ownership of a host directory.
+
+## Development toolchain
+
+The image includes Git, GitHub CLI, curl, wget, jq, Bash, OpenSSH client,
+ripgrep, fd (`fdfind` alias), unzip/zip/tar/xz, make, GCC/G++, build-essential,
+pkg-config, Node 22 with npm/npx, pnpm, Python 3 with venv support, uv/uvx,
+OpenJDK 21, Maven, and basic process/network inspection utilities.
+
+Chromium stays in the Playwright sidecar rather than duplicating a browser in
+the development image. Astro, Vite, Angular CLI, and other frameworks are
+**project-local dependencies**, never globally installed. GitHub CLI uses
+`GH_TOKEN`, populated from the existing optional GitHub MCP token. Git identity
+and SSH keys are configured by the user in the persistent home when needed.
+
+Node/Debian and uv images are digest-pinned in `Dockerfile`; pnpm and OpenCode
+have explicit versions. Debian packages use the signed Trixie repositories so
+uncached rebuilds pick up security fixes. Their installed versions are recorded
+at `/usr/local/share/opencode-stack/debian-packages.tsv`. This is a reproducible
+build procedure, not a byte-identical frozen Debian package snapshot.
+The official uv image supplies a self-contained static executable (its version
+may say musl); Node and the workstation OS use glibc.
 
 ## Install
 
 Requirements:
 
-- Linux with Docker Engine and the Docker Compose plugin
+- Linux with Docker Engine, the Docker Compose plugin, and host Python 3
 - An absolute path to a directory containing development repositories
 - Tailscale on the host only if remote tailnet access is wanted
 
@@ -74,7 +102,7 @@ Initialize the stack with the external workspace path:
 
 The setup script creates a mode-`0600` `.env`, generates a random 256-bit
 server password, prompts without echo for MCP API keys, validates Docker, and
-pulls official images pinned by version and multi-platform manifest digest.
+builds the development image and pulls the digest-pinned Playwright image.
 When `.env` already exists, rerun `sudo ./scripts/setup.sh` without a workspace
 argument to add or rotate MCP keys while preserving existing values when a
 prompt is left blank.
@@ -101,9 +129,10 @@ absolute path. Open a new shell after setup. A PATH prepend alone is insufficien
 mise can put its own OpenCode binary first again on an environment refresh.
 For other shells and scripts, invoke `~/.local/bin/opencode` explicitly.
 
-The script also adds local `opencode-stack/*:<version>` aliases so image
-management tools such as lazydocker show useful names. Compose still runs the
-official digest-pinned images.
+The built development image is tagged `opencode-stack/workstation:<version>`;
+Playwright also receives a readable local alias. `.dockerignore` allowlists only
+the Dockerfile and container helper scripts: secrets, backups, config, and
+application repositories are excluded from the build context.
 
 Start, inspect, and stop the server:
 
@@ -117,6 +146,86 @@ Normal shutdown retains persistent state. To inspect logs, run:
 
 ```sh
 docker compose logs -f opencode
+```
+
+### Rebuild and restart
+
+```sh
+sudo docker compose -f compose.yaml build --pull opencode
+sudo ./scripts/start.sh
+sudo ./scripts/doctor.sh
+```
+
+`start.sh` uses the cached build where possible, refreshes dependency overlays,
+and brings up **both** OpenCode and Playwright. Compose recreates the sidecar
+when its network-namespace owner is replaced. Do not replace just OpenCode
+with `up --no-deps` and leave a sidecar attached to its previous namespace.
+Recreate containers after config changes; existing clients may need to reconnect.
+To refresh Debian security packages even when Docker's build cache is valid,
+add `--no-cache` to the build command. No host packages are installed by setup.
+
+### JavaScript dependencies
+
+`scripts/dependencies.py`, called by setup/start, scans `WORKSPACE_DIR` for
+`package.json` files, excluding dependency trees, VCS directories, and common
+build/cache directories. It generates the ignored `compose.override.yaml`
+automatically loaded by Compose. Each package's `node_modules` gets a separate
+named volume with `nocopy: true`, keyed by its relative path, Node major,
+glibc strategy, and CPU architecture. Nested workspace packages are covered.
+
+Existing host `node_modules` are hidden inside the container, not copied,
+deleted, or chowned. If a mountpoint directory is absent, the generator creates
+only that empty directory with the host user's ownership. It initializes only
+empty dependency-volume roots, verifies project labels on existing volumes,
+and never removes old volumes. A user-managed `compose.override.yaml` is not
+overwritten; merge overlays explicitly in that case.
+
+After adding a package/project, run `sudo ./scripts/start.sh` before installing
+dependencies. Doctor detects a stale inventory or missing/wrong running mounts.
+Symlinked directory trees and generated output directories are not scanned.
+Do not install through an unregistered/symlink alias to a host dependency tree.
+
+Run installation **inside OpenCode**, as its non-root user:
+
+```sh
+docker compose exec -w /absolute/path/to/project opencode npm ci
+docker compose exec -w /absolute/path/to/project opencode npm run build
+# For a pnpm project, use its committed lockfile:
+docker compose exec -w /absolute/path/to/project opencode pnpm install --frozen-lockfile
+```
+
+Host and container installs are independent. Repeat the container install when
+the lockfile changes on the host. A malformed lockfile still needs deliberate
+project-level repair; do not delete it, copy host native modules, or download a
+temporary Node runtime to work around it. Projects requiring another Node or
+package-manager major need an explicit image/version decision.
+
+### Development servers and browser verification
+
+Start a project-local server normally, for example `npm run dev`. Its
+`http://localhost:4321` means the same thing to OpenCode and Playwright. No host
+port publication or `--host 0.0.0.0` is needed. Use the actual URL printed by the
+server: an IPv6-only `localhost` listener is not reachable via `127.0.0.1`.
+Development processes stop when OpenCode is recreated; start them again afterward.
+
+The enabled Playwright MCP offers normal navigation, snapshots, and evaluation
+to the agent. For a repeatable end-to-end check:
+
+```sh
+sudo ./scripts/workstation-test.sh
+```
+
+This uses the stack-owned `tests/workstation` Vite/Tailwind project, its committed
+lockfile and isolated dependencies. It runs all tool checks, `npm ci`, a native
+Tailwind build, starts a loopback-only server on port 4321, and invokes actual
+Playwright MCP navigation, accessibility snapshots and DOM evaluation from
+OpenCode. It stops its own server and removes temporary control files afterward.
+Port 4321 must be free in the shared namespace. It does not modify your app repos.
+
+For an already-running page:
+
+```sh
+docker compose exec opencode browser-check http://localhost:4321
 ```
 
 ## Connect
@@ -192,14 +301,15 @@ from `.env` using OpenCode's `{env:VARIABLE}` syntax:
 | --- | --- | --- |
 | `websearch` | `https://mcp.exa.ai/mcp` | `EXA_API_KEY` |
 | `context7` | `https://mcp.context7.com/mcp` | `CONTEXT7_API_KEY` |
-| `playwright` | Internal container at `http://playwright:8931/mcp` | None |
+| `playwright` | Shared-loopback sidecar at `http://127.0.0.1:8931/mcp` | None |
 | `github` | `https://api.githubcopilot.com/mcp/` | `GITHUB_PERSONAL_ACCESS_TOKEN` |
 | `postman` | `https://mcp.postman.com/minimal` | `POSTMAN_API_KEY` |
 
-Exa and Context7 allow anonymous access with lower limits. GitHub and Postman
-credentials are required by setup because API keys are the most predictable
-option for this unattended server stack. Run setup again to configure or rotate
-them:
+Exa and Context7 remain enabled and allow anonymous access with lower limits.
+Playwright is enabled. GitHub and Postman retain their existing disabled state;
+enable them in the checked-in config when wanted. Their hosted URLs and secret
+headers do not depend on the base image or Docker namespace. All MCP credential
+prompts remain optional. Run setup again to configure or rotate them:
 
 ```sh
 sudo ./scripts/setup.sh
@@ -210,18 +320,15 @@ Secrets remain in `.env`, which is ignored by Git and restricted to mode
 are therefore visible to host users with Docker daemon or root access. Docker
 does not provide a security boundary against its own administrators.
 
-To upgrade, choose a published tag from the official
-`ghcr.io/anomalyco/opencode` image and obtain its multi-platform digest:
+To upgrade OpenCode, choose an official `opencode-ai` npm release, change
+`OPENCODE_VERSION` in `.env`, then rebuild. `OPENCODE_IMAGE_DIGEST` from the old
+runtime-only setup is no longer used. Upgrade Node/Debian, uv, and pnpm pins in
+`Dockerfile` deliberately and run the workstation integration check:
 
 ```sh
-docker buildx imagetools inspect ghcr.io/anomalyco/opencode:VERSION
-```
-
-Change both `OPENCODE_VERSION` and `OPENCODE_IMAGE_DIGEST` in `.env`, then run:
-
-```sh
-docker compose pull
+docker compose -f compose.yaml build --pull opencode
 ./scripts/start.sh
+./scripts/workstation-test.sh
 ```
 
 Do not use `latest` if reproducibility matters.
@@ -265,10 +372,29 @@ umask 077
 mkdir -p backups
 docker compose run --rm --no-deps -T --entrypoint tar opencode \
   -C /home/opencode/.local -czf - . > backups/opencode-$(date +%Y%m%d).backup.tar.gz
+docker compose run --rm --no-deps -T --entrypoint tar opencode \
+  --exclude=./.local -C /home/opencode -czf - . > backups/opencode-home-$(date +%Y%m%d).backup.tar.gz
 ```
 
 The `backups/` directory and `*.backup.tar.gz` are ignored by Git. Move backups
 to encrypted storage; a local ignored file is not sufficient protection.
+Back up both volumes: `.local` contains the original OpenCode sessions/auth;
+the home backup contains other application configuration, credentials and caches.
+Dependency volumes are rebuildable from project lockfiles and are not included.
+
+### Upgrade from the previous Alpine stack
+
+Back up before recreating the service. The Debian image keeps the exact existing
+`opencode-data` volume and `.local/share`/`.local/state` paths; no ownership
+migration is needed if they already match `HOST_UID:HOST_GID`. The new home
+volume is initialized from user-owned image directories. Nothing is copied from
+host `node_modules` or temporary runtimes in the old container. The old tmpfs
+home and `/tmp` were ephemeral; save any manually placed files there separately.
+
+Installing Git lets OpenCode recognize repositories that previously fell back
+to its `global` project. OpenCode may update existing sessions' project IDs and
+timestamps during that discovery; verify their session IDs and messages rather
+than mistaking this reassociation for deletion.
 
 ## Migrate an existing root-owned data volume
 
@@ -293,7 +419,7 @@ the volume, or recursively change ownership of the host workspace.
    test "$uid" -ne 0 && test "$gid" -ne 0
    docker compose stop opencode
    container=$(docker compose ps -aq opencode)
-   volume=$(docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}' "$container")
+   volume=$(docker inspect --format '{{range .Mounts}}{{if or (eq .Destination "/root/.local") (eq .Destination "/home/opencode/.local")}}{{.Name}}{{end}}{{end}}' "$container")
    image=$(docker inspect --format '{{.Image}}' "$container")
    project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$container")
    docker volume inspect "$volume"
@@ -331,7 +457,7 @@ the volume, or recursively change ownership of the host workspace.
      --mount "type=volume,src=$volume,dst=/data" \
      --entrypoint sh "$image" -eu -c \
      'find /data -xdev -exec chown -h "$1:$2" {} +' sh "$uid" "$gid"
-   docker compose up --detach --no-deps --wait opencode
+   docker compose up --detach --wait
    ./scripts/doctor.sh
    docker compose exec -T opencode opencode auth list
    docker compose exec -T opencode opencode db 'PRAGMA integrity_check'
@@ -353,6 +479,10 @@ workspace files are not repaired automatically; review individual affected
 files separately. This configuration assumes ordinary Linux Docker UID mapping;
 rootless Docker or user-namespace remapping may need additional mapping work,
 and doctor will expose a mismatch.
+If changing the host identity on an existing workstation, rebuild the passwd
+entry and separately back up/review ownership of the `opencode-home` and
+dependency volumes too. Existing non-empty volumes are never recursively
+chowned automatically by setup/start.
 
 ## Recovery
 
@@ -390,10 +520,12 @@ paths are `~/.local/share/opencode` for the database/auth data and
 | --- | --- | --- |
 | Database, sessions, logs, provider `auth.json` | `/home/opencode/.local/share/opencode` | Existing named volume |
 | State and locks | `/home/opencode/.local/state/opencode` | Existing named volume |
-| Cache and downloaded tools | `/home/opencode/.cache/opencode` | Ephemeral home tmpfs |
-| Config | `/home/opencode/.config/opencode` | Read-only `./opencode` bind |
+| Cache and downloaded tools | `/home/opencode/.cache/opencode` | Persistent home volume |
+| Writable application config | `/home/opencode/.config` | Persistent home volume |
+| Managed OpenCode config and skills | `/etc/opencode-stack` | Read-only `./opencode` bind |
+| Temporary OpenCode files | `/tmp/opencode` | User-owned tmpfs |
 
-These paths were verified with `opencode debug paths` in the pinned official
-image and its [global path implementation](https://github.com/anomalyco/opencode/blob/v1.18.29/packages/core/src/global.ts).
-No XDG overrides or passwd entry are required. Cache is regenerated after
-container recreation; database/session data and provider logins persist.
+These paths are verified with `opencode debug paths` and the pinned release's
+[global path implementation](https://github.com/anomalyco/opencode/blob/v1.18.29/packages/core/src/global.ts).
+No XDG overrides are required. The image provides a matching passwd entry;
+database/session data, provider logins, application config and caches persist.

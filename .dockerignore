@@ -1,0 +1,7 @@
+# Allowlist the build context: never send .env, credentials, backups or repos.
+**
+!Dockerfile
+!scripts/
+!scripts/container-entrypoint.sh
+!scripts/toolchain-check.sh
+!scripts/browser-check.py

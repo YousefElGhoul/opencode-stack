@@ -2,6 +2,9 @@
   "$schema": "https://opencode.ai/config.json",
   "autoupdate": false,
   "share": "disabled",
+  "skills": {
+    "paths": ["/etc/opencode-stack/skills"]
+  },
   "mcp": {
     "websearch": {
       "type": "remote",
@@ -21,8 +24,8 @@
     },
     "playwright": {
       "type": "remote",
-      "url": "http://playwright:8931/mcp",
-      "enabled": false
+      "url": "http://127.0.0.1:8931/mcp",
+      "enabled": true
     },
     "github": {
       "type": "remote",

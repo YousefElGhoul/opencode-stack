@@ -134,10 +134,45 @@ if command -v docker >/dev/null 2>&1 && docker compose ps --status running --ser
   else
     fail 'Running container does not use the configured same-path workspace mount'
   fi
-  if docker inspect --format '{{range .Mounts}}{{printf "%s|%s|%s|%t\n" .Type .Source .Destination .RW}}{{end}}' "$container" | grep -Fqx "bind|$root/opencode|/home/opencode/.config/opencode|false"; then
+  if docker inspect --format '{{range .Mounts}}{{printf "%s|%s|%s|%t\n" .Type .Source .Destination .RW}}{{end}}' "$container" | grep -Fqx "bind|$root/opencode|/etc/opencode-stack|false"; then
     ok 'OpenCode config bind mount is read-only'
   else
     fail 'OpenCode config bind mount is missing or writable'
+  fi
+  if docker exec "$container" sh -eu -c '
+    for dir in "$HOME" "$HOME/.config" "$HOME/.config/opencode" "$HOME/.cache" /tmp/opencode; do
+      test "$(stat -c %u:%g "$dir")" = "$(id -u):$(id -g)"
+      file=$(mktemp "$dir/.doctor-write.XXXXXXXXXX")
+      rm -f "$file"
+    done
+  '; then
+    ok 'Actual home, application config, cache, and OpenCode temp are owned and writable by the runtime user'
+  else
+    fail 'A runtime home/config/cache/temp directory is not owned or writable by OpenCode'
+  fi
+  browser=$(docker compose ps -q playwright)
+  if [ -n "$browser" ] && [ "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$browser")" = "container:$container" ]; then
+    ok 'Playwright shares OpenCode networking: localhost dev servers are reachable'
+  else
+    fail 'Playwright is not attached to the current OpenCode network namespace; recreate both services'
+  fi
+  if docker exec "$container" sh -eu -c '
+    auth=$(printf "opencode:%s" "$OPENCODE_SERVER_PASSWORD" | base64 | tr -d "\n")
+    printf "Authorization: Basic %s\n" "$auth" |
+      curl -fsS --max-time 30 --header @- http://127.0.0.1:4096/mcp |
+      jq -e '\''.playwright.status == "connected"'\'' >/dev/null
+  '; then
+    ok 'OpenCode is connected to the Playwright MCP protocol endpoint'
+  else
+    fail 'OpenCode cannot connect to Playwright MCP (check its URL and allowed-hosts)'
+  fi
+  if docker exec "$container" toolchain-check >/dev/null 2>&1; then
+    ok 'Development toolchain is installed (glibc, Node 22/npm/npx/pnpm, Python/uv, JDK 21/Maven, CLI utilities)'
+  else
+    fail 'Development toolchain check failed; run docker compose exec opencode toolchain-check'
+  fi
+  if ! python3 "$root/scripts/dependencies.py" --check; then
+    fail 'Dependency isolation check failed; run scripts/start.sh'
   fi
   runtime_user=$(docker inspect --format '{{.Config.User}}' "$container")
   if [ "$runtime_user" = "$host_uid:$host_gid" ] && docker exec "$container" sh -eu -c '

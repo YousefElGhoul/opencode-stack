@@ -18,6 +18,10 @@ command -v docker >/dev/null 2>&1 || {
 }
 docker compose version >/dev/null
 docker info >/dev/null
+command -v python3 >/dev/null 2>&1 || {
+  printf 'Host Python 3 is required to generate dependency mounts.\n' >&2
+  exit 1
+}
 
 umask 077
 
@@ -166,7 +170,6 @@ fi
 set_env HOST_UID "$host_uid"
 set_env HOST_GID "$host_gid"
 ensure_env OPENCODE_VERSION 1.18.29
-ensure_env OPENCODE_IMAGE_DIGEST sha256:ecc3bf96ee55dad226d9cde50d79aaa8a1215c47860c0fcdc71570461bf438b8
 ensure_env PLAYWRIGHT_MCP_VERSION v0.0.80
 ensure_env PLAYWRIGHT_MCP_IMAGE_DIGEST sha256:dda1f7f9b812e22946635c8af7df9288b96d3b9e3f0f1b8576d6823e2031c1de
 
@@ -177,8 +180,10 @@ prompt_secret 'Postman API key' POSTMAN_API_KEY false
 
 install_client
 
-docker compose config --quiet
-docker compose pull
+docker compose -f compose.yaml config --quiet
+docker compose -f compose.yaml build --pull opencode
+docker compose -f compose.yaml pull playwright
+python3 "$root/scripts/dependencies.py"
 # Only initialize an empty volume. Existing state requires the explicit,
 # backed-up migration in README.md; setup never recursively changes ownership.
 docker compose run --rm --no-deps -T --user 0:0 --entrypoint sh opencode -eu -c '
@@ -199,15 +204,11 @@ if ! docker compose run --rm --no-deps -T --entrypoint sh opencode -eu -c '
   printf 'Persistent data needs an ownership migration. Follow README.md before starting OpenCode.\n' >&2
   exit 1
 fi
-image=$(docker compose config --images | grep '^ghcr.io/anomalyco/opencode:')
-version=${image%%@*}
-version=${version##*:}
-docker image tag "$image" "opencode-stack/opencode:$version"
 image=$(docker compose config --images | grep '^mcr.microsoft.com/playwright/mcp:')
 version=${image%%@*}
 version=${version##*:}
 docker image tag "$image" "opencode-stack/playwright-mcp:$version"
-printf 'Configured .env with mode 0600 and pulled the pinned images.\n'
+printf 'Configured .env with mode 0600, built the workstation, and prepared isolated JS dependencies.\n'
 printf 'Installed the authenticated client launcher in ~/.local/bin/opencode.\n'
 printf 'Open a new Bash shell to load the launcher function; other shells should invoke ~/.local/bin/opencode explicitly.\n'
 printf 'Run ./scripts/start.sh to start the server.\n'
